@@ -197,12 +197,14 @@ let updateInterval = null;
 
 // --- КЛИЕНТЫ ---
 function refreshClients() {
+    console.log('[DEBUG] Обновление списка клиентов...');
     fetch('/api/clients')
         .then(r => r.json())
         .then(data => {
+            console.log('[DEBUG] Получены клиенты:', data);
             const list = document.getElementById('clients-list');
             list.innerHTML = '';
-            if (data.clients.length === 0) {
+            if (!data.clients || data.clients.length === 0) {
                 list.innerHTML = '<div style="color:#666; text-align:center; padding:20px;">Нет активных клиентов</div>';
                 document.getElementById('status-text').textContent = 'Онлайн: 0';
                 return;
@@ -224,7 +226,9 @@ function refreshClients() {
             const online = data.clients.filter(c => c.online).length;
             document.getElementById('status-text').textContent = 'Онлайн: ' + online + '/' + data.clients.length;
         })
-        .catch(() => {});
+        .catch(e => {
+            console.error('[ERROR] Ошибка загрузки клиентов:', e);
+        });
 }
 
 // --- ВЫБОР КЛИЕНТА ---
@@ -538,6 +542,7 @@ function saveUpdateCode() {
 }
 
 // --- ИНИЦИАЛИЗАЦИЯ ---
+console.log('[DEBUG] Загрузка страницы...');
 refreshClients();
 setInterval(refreshClients, 10000);
 </script>
